@@ -22,20 +22,45 @@ type RADaemon struct {
 	stopChans map[string]chan struct{}
 	wg        sync.WaitGroup
 	verbose   bool
+	logLevel  string
 }
 
 func NewRADaemon(config *Config, verbose bool) *RADaemon {
+	logLevel := strings.ToLower(config.LogLevel)
+	if logLevel == "" {
+		logLevel = "normal"
+	}
+
+	// Override with command line verbose flag
+	if verbose {
+		logLevel = "verbose"
+	}
+
 	return &RADaemon{
 		config:    config,
 		listeners: make(map[string]*net.PacketConn),
 		stopChans: make(map[string]chan struct{}),
 		verbose:   verbose,
+		logLevel:  logLevel,
 	}
 }
 
 func (d *RADaemon) logVerbose(format string, args ...interface{}) {
-	if d.verbose {
+	if d.logLevel == "verbose" {
 		log.Printf("[VERBOSE] "+format, args...)
+	}
+}
+
+func (d *RADaemon) logNormal(format string, args ...interface{}) {
+	if d.logLevel == "verbose" || d.logLevel == "normal" {
+		log.Printf(format, args...)
+	}
+}
+
+func (d *RADaemon) logSilent(format string, args ...interface{}) {
+	// Only log critical messages (errors) in silent mode
+	if d.logLevel == "verbose" || d.logLevel == "normal" || d.logLevel == "silent" {
+		log.Printf(format, args...)
 	}
 }
 
@@ -51,12 +76,12 @@ func (d *RADaemon) Start() error {
 
 			// Load existing routes from system table
 			if err := d.loadExistingRoutes(ifName, configName, ifConfig); err != nil {
-				log.Printf("Warning: Failed to load existing routes for %s/%s: %v", ifName, configName, err)
+				d.logSilent("Warning: Failed to load existing routes for %s/%s: %v", ifName, configName, err)
 			}
 
 			// Load existing addresses
 			if err := d.loadExistingAddresses(ifName, configName, ifConfig); err != nil {
-				log.Printf("Warning: Failed to load existing addresses for %s/%s: %v", ifName, configName, err)
+				d.logSilent("Warning: Failed to load existing addresses for %s/%s: %v", ifName, configName, err)
 			}
 		}
 
@@ -67,7 +92,7 @@ func (d *RADaemon) Start() error {
 		go d.listenInterface(ifName, ifConfigs, stopChan)
 	}
 
-	log.Println("RA daemon started")
+	d.logNormal("RA daemon started")
 	return nil
 }
 
@@ -81,7 +106,7 @@ func (d *RADaemon) Stop() {
 		(*conn).Close()
 	}
 
-	log.Println("RA daemon stopped")
+	d.logNormal("RA daemon stopped")
 }
 
 func (d *RADaemon) configureInterface(ifName string) error {
@@ -108,7 +133,7 @@ func (d *RADaemon) listenInterface(ifName string, configs map[string]*InterfaceC
 	// Create ICMPv6 socket
 	conn, err := net.ListenPacket("ip6:ipv6-icmp", "::")
 	if err != nil {
-		log.Printf("Failed to create ICMPv6 socket for %s: %v", ifName, err)
+		d.logSilent("Failed to create ICMPv6 socket for %s: %v", ifName, err)
 		return
 	}
 	defer conn.Close()
@@ -118,14 +143,14 @@ func (d *RADaemon) listenInterface(ifName string, configs map[string]*InterfaceC
 	// Bind to specific interface
 	ipConn, ok := conn.(*net.IPConn)
 	if !ok {
-		log.Printf("Failed to assert conn to *net.IPConn for %s", ifName)
+		d.logSilent("Failed to assert conn to *net.IPConn for %s", ifName)
 		return
 	}
 
 	// Use syscall to bind to interface
 	fd, err := ipConn.SyscallConn()
 	if err != nil {
-		log.Printf("Failed to get syscall conn for %s: %v", ifName, err)
+		d.logSilent("Failed to get syscall conn for %s: %v", ifName, err)
 		return
 	}
 
@@ -133,7 +158,7 @@ func (d *RADaemon) listenInterface(ifName string, configs map[string]*InterfaceC
 		syscall.SetsockoptString(int(fdInt), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, ifName)
 	})
 	if err != nil {
-		log.Printf("Failed to bind to interface %s: %v", ifName, err)
+		d.logSilent("Failed to bind to interface %s: %v", ifName, err)
 		return
 	}
 
@@ -148,13 +173,13 @@ func (d *RADaemon) listenInterface(ifName string, configs map[string]*InterfaceC
 	filter.Accept(ipv6.ICMPTypeRouterAdvertisement)
 
 	if err := p.SetICMPFilter(filter); err != nil {
-		log.Printf("Failed to set ICMP filter for %s: %v", ifName, err)
+		d.logSilent("Failed to set ICMP filter for %s: %v", ifName, err)
 		return
 	}
 
 	d.logVerbose("Set ICMPv6 filter for %s to accept Router Advertisements only", ifName)
 
-	log.Printf("Listening for RAs on interface %s", ifName)
+	d.logNormal("Listening for RAs on interface %s", ifName)
 
 	buffer := make([]byte, 1500)
 	for {
@@ -169,7 +194,7 @@ func (d *RADaemon) listenInterface(ifName string, configs map[string]*InterfaceC
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				}
-				log.Printf("Error reading from %s: %v", ifName, err)
+				d.logSilent("Error reading from %s: %v", ifName, err)
 				continue
 			}
 
@@ -188,7 +213,7 @@ func (d *RADaemon) processRA(ifName string, configs map[string]*InterfaceConfig,
 
 	msg, err := icmp.ParseMessage(58, data) // 58 is the protocol number for ICMPv6
 	if err != nil {
-		log.Printf("Failed to parse ICMP message: %v", err)
+		d.logSilent("Failed to parse ICMP message: %v", err)
 		return
 	}
 
@@ -200,12 +225,12 @@ func (d *RADaemon) processRA(ifName string, configs map[string]*InterfaceConfig,
 		return
 	}
 
-	log.Printf("Received RA from %s on %s", addr, ifName)
+	d.logNormal("Received RA from %s on %s", addr, ifName)
 
 	// Parse RA body manually
 	body, ok := msg.Body.(*icmp.RawBody)
 	if !ok {
-		log.Printf("Failed to get raw body from RA")
+		d.logSilent("Failed to get raw body from RA")
 		return
 	}
 
@@ -213,7 +238,7 @@ func (d *RADaemon) processRA(ifName string, configs map[string]*InterfaceConfig,
 
 	// Parse RA header and options
 	if len(body.Data) < 12 {
-		log.Printf("RA message too short")
+		d.logSilent("RA message too short")
 		return
 	}
 
@@ -390,7 +415,7 @@ func (d *RADaemon) parseRAOptions(ifName, configName string, config *InterfaceCo
 					Mask: net.CIDRMask(int(prefixLen), 128),
 				}
 
-				log.Printf("Found prefix option: %s, flags: 0x%02x", prefix, flags)
+				d.logNormal("Found prefix option: %s, flags: 0x%02x", prefix, flags)
 				d.logVerbose("On-link flag: %t, Autonomous flag: %t", flags&0x80 != 0, flags&0x40 != 0)
 
 				// Check against configured match patterns
@@ -416,7 +441,7 @@ func (d *RADaemon) parseRAOptions(ifName, configName string, config *InterfaceCo
 						d.logVerbose("Skipping auto-IP for prefix %s (auto-ip disabled)", prefix)
 					}
 				} else {
-					log.Printf("Rejecting prefix %s in config %s (blacklisted or not in allow list)", prefix, configName)
+					d.logVerbose("Rejecting prefix %s in config %s (blacklisted or not in allow list)", prefix, configName)
 					if config.Prefix != nil {
 						d.logVerbose("Prefix allow list: %v", config.Prefix.Allow)
 						d.logVerbose("Prefix blacklist: %v", config.Prefix.Blacklist)
@@ -449,7 +474,7 @@ func (d *RADaemon) parseRAOptions(ifName, configName string, config *InterfaceCo
 					Mask: net.CIDRMask(int(routePrefixLen), 128),
 				}
 
-				log.Printf("Found route option: %s, preference: %d, lifetime: %d",
+				d.logNormal("Found route option: %s, preference: %d, lifetime: %d",
 					routePrefix, (flags>>3)&0x3, routeLifetime)
 
 				// Check if this route matches our configuration
@@ -464,7 +489,7 @@ func (d *RADaemon) parseRAOptions(ifName, configName string, config *InterfaceCo
 						d.logVerbose("Skipping route %s (lifetime is 0)", routePrefix)
 					}
 				} else {
-					log.Printf("Rejecting route %s in config %s (blacklisted or not in allow list)", routePrefix, configName)
+					d.logVerbose("Rejecting route %s in config %s (blacklisted or not in allow list)", routePrefix, configName)
 					if config.Route != nil {
 						d.logVerbose("Route allow list: %v", config.Route.Allow)
 						d.logVerbose("Route blacklist: %v", config.Route.Blacklist)
@@ -511,12 +536,12 @@ func (d *RADaemon) addRoute(ifName, configName string, prefix *net.IPNet, table 
 	if err := cmd.Run(); err != nil {
 		// Check if route already exists (ignore this error)
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 2 {
-			log.Printf("Route %s already exists in table %d", prefix, table)
+			d.logVerbose("Route %s already exists in table %d", prefix, table)
 		} else {
-			log.Printf("Failed to add route %s: %v", prefix, err)
+			d.logSilent("Failed to add route %s: %v", prefix, err)
 		}
 	} else {
-		log.Printf("Added route %s to table %d (config: %s)", prefix, table, configName)
+		d.logNormal("Added route %s to table %d (config: %s)", prefix, table, configName)
 		// Track the route
 		if config := d.getInterfaceConfig(ifName, configName); config != nil {
 			config.AddRoute(routeKey)
@@ -537,12 +562,12 @@ func (d *RADaemon) addDefaultRoute(ifName, configName, gateway string, table int
 	if err := cmd.Run(); err != nil {
 		// Check if route already exists (ignore this error)
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 2 {
-			log.Printf("Default route via %s already exists in table %d", gateway, table)
+			d.logVerbose("Default route via %s already exists in table %d", gateway, table)
 		} else {
-			log.Printf("Failed to add default route via %s: %v", gateway, err)
+			d.logSilent("Failed to add default route via %s: %v", gateway, err)
 		}
 	} else {
-		log.Printf("Added default route via %s to table %d (config: %s)", gateway, table, configName)
+		d.logNormal("Added default route via %s to table %d (config: %s)", gateway, table, configName)
 		// Track the route
 		if config := d.getInterfaceConfig(ifName, configName); config != nil {
 			config.AddRoute(routeKey)
@@ -563,12 +588,12 @@ func (d *RADaemon) addRouteVia(ifName, configName string, routeNet *net.IPNet, g
 	if err := cmd.Run(); err != nil {
 		// Check if route already exists (ignore this error)
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 2 {
-			log.Printf("Route %s via %s already exists in table %d", routeNet, gateway, table)
+			d.logVerbose("Route %s via %s already exists in table %d", routeNet, gateway, table)
 		} else {
-			log.Printf("Failed to add route %s via %s: %v", routeNet, gateway, err)
+			d.logSilent("Failed to add route %s via %s: %v", routeNet, gateway, err)
 		}
 	} else {
-		log.Printf("Added route %s via %s to table %d (config: %s)", routeNet, gateway, table, configName)
+		d.logNormal("Added route %s via %s to table %d (config: %s)", routeNet, gateway, table, configName)
 		// Track the route
 		if config := d.getInterfaceConfig(ifName, configName); config != nil {
 			config.AddRoute(routeKey)
@@ -582,7 +607,7 @@ func (d *RADaemon) configureAutoIP(ifName, configName string, prefix *net.IPNet,
 	// Generate SLAAC address using EUI-64 or random generation
 	iface, err := net.InterfaceByName(ifName)
 	if err != nil {
-		log.Printf("Failed to get interface %s for auto-IP: %v", ifName, err)
+		d.logSilent("Failed to get interface %s for auto-IP: %v", ifName, err)
 		return
 	}
 
@@ -638,15 +663,15 @@ func (d *RADaemon) configureAutoIP(ifName, configName string, prefix *net.IPNet,
 				// Track it anyway since it exists
 				config.AddRoute(addrKey)
 			} else {
-				log.Printf("Failed to add auto-configured IP %s to %s: %v", autoIP, ifName, err)
+				d.logSilent("Failed to add auto-configured IP %s to %s: %v", autoIP, ifName, err)
 				return
 			}
 		} else {
-			log.Printf("Failed to add auto-configured IP %s to %s: %v", autoIP, ifName, err)
+			d.logSilent("Failed to add auto-configured IP %s to %s: %v", autoIP, ifName, err)
 			return
 		}
 	} else {
-		log.Printf("Auto-configured IP %s/%d on %s", autoIP, prefixLen, ifName)
+		d.logNormal("Auto-configured IP %s/%d on %s", autoIP, prefixLen, ifName)
 		// Track the new address
 		config.AddRoute(addrKey)
 	}
@@ -674,10 +699,10 @@ func (d *RADaemon) addSelfRoute(ifName, configName string, prefix *net.IPNet, se
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 2 {
 			d.logVerbose("Self-route %s via %s already exists in table %d", prefix, selfIP, table)
 		} else {
-			log.Printf("Failed to add self-route %s via %s: %v", prefix, selfIP, err)
+			d.logSilent("Failed to add self-route %s via %s: %v", prefix, selfIP, err)
 		}
 	} else {
-		log.Printf("Added self-route %s via %s to table %d (config: %s)", prefix, selfIP, table, configName)
+		d.logNormal("Added self-route %s via %s to table %d (config: %s)", prefix, selfIP, table, configName)
 		// Track the route
 		if config := d.getInterfaceConfig(ifName, configName); config != nil {
 			config.AddRoute(routeKey)

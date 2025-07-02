@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 )
 
@@ -18,6 +19,20 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
+	// Set initial log behavior based on config before creating daemon
+	logLevel := strings.ToLower(config.LogLevel)
+	if logLevel == "" {
+		logLevel = "normal"
+	}
+	if *verbose {
+		logLevel = "verbose"
+	}
+
+	// Only log startup in non-silent mode
+	if logLevel != "silent" {
+		log.Printf("Starting radvan-go with log level: %s", logLevel)
+	}
+
 	daemon := NewRADaemon(config, *verbose)
 	if err := daemon.Start(); err != nil {
 		log.Fatalf("Failed to start daemon: %v", err)
@@ -28,6 +43,8 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
-	log.Println("Shutting down...")
+	if logLevel != "silent" {
+		log.Println("Shutting down...")
+	}
 	daemon.Stop()
 }

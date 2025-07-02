@@ -9,6 +9,7 @@ import (
 )
 
 type Config struct {
+	LogLevel   string                                 `yaml:"loglevel"`
 	Interfaces map[string]map[string]*InterfaceConfig `yaml:"interfaces"`
 }
 

@@ -1,3 +1,4 @@
+loglevel: silent # options: silent, verbose
 interfaces:
   enp9s0:
     config1:
