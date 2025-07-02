@@ -1,0 +1,359 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            # Extract version from tag (remove 'v' prefix if present)
+            VERSION=${GITHUB_REF#refs/tags/v}
+            VERSION=${VERSION#refs/tags/}  # Also handle tags without 'v' prefix
+          else
+            # For non-tagged builds, get latest release version
+            LATEST_RELEASE=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/latest" | jq -r '.tag_name // empty')
+            if [ -n "$LATEST_RELEASE" ]; then
+              # Remove 'v' prefix if present and use latest release version
+              VERSION=${LATEST_RELEASE#v}
+              echo "Using latest release version: $VERSION"
+            else
+              # Only use 1.0.0 if no releases exist at all
+              VERSION="1.0.0"
+              echo "No releases found, using default version: $VERSION"
+            fi
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "deb_filename=radvan-go-${VERSION}_amd64.deb" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build binary
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v -ldflags="-w -s" -o radvan-go .
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev fakeroot
+
+      - name: Create Debian package structure
+        run: |
+          mkdir -p debian-package/DEBIAN
+          mkdir -p debian-package/usr/local/bin
+          mkdir -p debian-package/etc/systemd/system
+          mkdir -p debian-package/etc/radvan-go
+          mkdir -p debian-package/usr/share/doc/radvan-go
+          mkdir -p debian-package/usr/lib/radvan-go
+          
+          # Copy binary
+          cp radvan-go debian-package/usr/local/bin/
+          chmod +x debian-package/usr/local/bin/radvan-go
+          
+          # Copy systemd service file
+          cp radvan-go.service debian-package/etc/systemd/system/
+          
+          # Copy configuration file as example
+          cp config.yaml debian-package/etc/radvan-go/config.yaml.example
+          
+          # Copy documentation
+          cp README.md debian-package/usr/share/doc/radvan-go/
+          
+          # Copy install script as reference
+          cp install.sh debian-package/usr/lib/radvan-go/install.sh
+          chmod +x debian-package/usr/lib/radvan-go/install.sh
+          
+          # Create control file
+          cat > debian-package/DEBIAN/control << EOF
+          Package: radvan-go
+          Version: ${{ steps.version.outputs.version }}
+          Section: net
+          Priority: optional
+          Architecture: amd64
+          Maintainer: radvan-go team <maintainer@example.com>
+          Description: Router Advertisement Processing Agent for Agentic Networks
+           radvan-go is a specialized IPv6 Router Advertisement (RA) processing daemon
+           designed for agentic networks. It provides fine-grained control over IPv6
+           prefix and route management by selectively processing RA messages from
+           specific routers and applying custom routing policies.
+           .
+           Features include selective RA processing, custom routing table management,
+           SLAAC address configuration, and comprehensive filtering capabilities.
+          Depends: systemd, iproute2
+          Recommends: iputils-ping
+          Homepage: https://github.com/yourusername/radvan-go
+          EOF
+          
+          # Create conffiles
+          cat > debian-package/DEBIAN/conffiles << EOF
+          /etc/radvan-go/config.yaml.example
+          EOF
+          
+          # Create postinst script
+          cat > debian-package/DEBIAN/postinst << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          # Check if this is an upgrade and if service was running
+          WAS_RUNNING=false
+          if [ "$1" = "configure" ] && [ -n "$2" ]; then
+              # This is an upgrade ($2 contains the old version)
+              if systemctl is-active --quiet radvan-go 2>/dev/null; then
+                  WAS_RUNNING=true
+              fi
+          fi
+          
+          # Create default config if it doesn't exist
+          if [ ! -f /etc/radvan-go/config.yaml ]; then
+              echo "Creating default configuration from example..."
+              cp /etc/radvan-go/config.yaml.example /etc/radvan-go/config.yaml
+              echo "Configuration created at /etc/radvan-go/config.yaml"
+              echo "Please edit this file to match your network setup."
+          fi
+          
+          # Reload systemd daemon
+          systemctl daemon-reload
+          
+          # Enable service
+          systemctl enable radvan-go || true
+          
+          # Start or restart service based on context
+          if [ "$WAS_RUNNING" = "true" ]; then
+              echo "Restarting radvan-go service..."
+              systemctl restart radvan-go || true
+          elif [ "$1" = "configure" ] && [ -z "$2" ]; then
+              # Fresh installation - don't start automatically
+              echo "radvan-go installed successfully."
+              echo ""
+              echo "Before starting the service:"
+              echo "  1. Edit /etc/radvan-go/config.yaml to match your network setup"
+              echo "  2. Ensure your system has IPv6 enabled"
+              echo "  3. Start the service: sudo systemctl start radvan-go"
+              echo ""
+              echo "View logs with: sudo journalctl -u radvan-go -f"
+              echo "Check status with: sudo systemctl status radvan-go"
+          fi
+          EOF
+          chmod +x debian-package/DEBIAN/postinst
+          
+          # Create prerm script
+          cat > debian-package/DEBIAN/prerm << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          # Only stop service on removal, not on upgrade
+          if [ "$1" = "remove" ]; then
+              echo "Stopping radvan-go service..."
+              systemctl stop radvan-go || true
+              systemctl disable radvan-go || true
+          fi
+          EOF
+          chmod +x debian-package/DEBIAN/prerm
+          
+          # Create postrm script
+          cat > debian-package/DEBIAN/postrm << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          if [ "$1" = "purge" ]; then
+              # Remove configuration files on purge
+              rm -rf /etc/radvan-go
+              echo "Configuration files removed."
+          fi
+          
+          # Reload systemd daemon
+          systemctl daemon-reload || true
+          EOF
+          chmod +x debian-package/DEBIAN/postrm
+
+      - name: Build Debian package
+        run: |
+          fakeroot dpkg-deb --build debian-package ${{ steps.version.outputs.deb_filename }}
+          
+          # Verify package
+          dpkg-deb --info ${{ steps.version.outputs.deb_filename }}
+          dpkg-deb --contents ${{ steps.version.outputs.deb_filename }}
+
+      - name: Run package tests
+        run: |
+          # Test that the binary works
+          ./radvan-go -h || true
+          
+          # Test package integrity
+          dpkg-deb --show ${{ steps.version.outputs.deb_filename }}
+          
+          # Test installation simulation
+          echo "Testing package installation simulation..."
+          dpkg-deb --extract ${{ steps.version.outputs.deb_filename }} test-install/
+          ls -la test-install/usr/local/bin/
+          ls -la test-install/etc/systemd/system/
+          ls -la test-install/etc/radvan-go/
+
+      - name: Generate checksums
+        run: |
+          sha256sum radvan-go > radvan-go.sha256
+          sha256sum ${{ steps.version.outputs.deb_filename }} > ${{ steps.version.outputs.deb_filename }}.sha256
+          md5sum radvan-go > radvan-go.md5
+          md5sum ${{ steps.version.outputs.deb_filename }} > ${{ steps.version.outputs.deb_filename }}.md5
+
+      - name: Get latest release
+        id: latest_release
+        uses: actions/github-script@v6
+        continue-on-error: true
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: releases } = await github.rest.repos.listReleases({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            
+            if (releases.length === 0) {
+              core.setOutput('has_release', 'false');
+              console.log('No releases found - skipping release upload');
+              return;
+            }
+            
+            const latestRelease = releases[0];
+            core.setOutput('has_release', 'true');
+            core.setOutput('release_id', latestRelease.id);
+            core.setOutput('release_tag', latestRelease.tag_name);
+
+      - name: Check if assets exist
+        id: check_assets
+        if: steps.latest_release.outputs.has_release == 'true'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const releaseId = ${{ steps.latest_release.outputs.release_id }};
+            
+            const { data: assets } = await github.rest.repos.listReleaseAssets({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: releaseId
+            });
+            
+            const assetNames = [
+              'radvan-go',
+              '${{ steps.version.outputs.deb_filename }}',
+              'radvan-go.sha256',
+              '${{ steps.version.outputs.deb_filename }}.sha256',
+              'radvan-go.md5',
+              '${{ steps.version.outputs.deb_filename }}.md5'
+            ];
+            
+            const existingAssets = {};
+            for (const asset of assets) {
+              if (assetNames.includes(asset.name)) {
+                existingAssets[asset.name] = asset.id;
+              }
+            }
+            
+            core.setOutput('existing_assets', JSON.stringify(existingAssets));
+
+      - name: Delete existing assets if they exist
+        if: steps.latest_release.outputs.has_release == 'true'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const existingAssets = JSON.parse('${{ steps.check_assets.outputs.existing_assets }}');
+            
+            for (const [assetName, assetId] of Object.entries(existingAssets)) {
+              console.log(`Deleting existing asset: ${assetName}`);
+              await github.rest.repos.deleteReleaseAsset({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                asset_id: parseInt(assetId)
+              });
+            }
+
+      - name: Upload assets to release
+        if: steps.latest_release.outputs.has_release == 'true'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const releaseId = '${{ steps.latest_release.outputs.release_id }}';
+            
+            const assets = [
+              { path: './radvan-go', name: 'radvan-go', contentType: 'application/octet-stream' },
+              { path: './${{ steps.version.outputs.deb_filename }}', name: '${{ steps.version.outputs.deb_filename }}', contentType: 'application/vnd.debian.binary-package' },
+              { path: './radvan-go.sha256', name: 'radvan-go.sha256', contentType: 'text/plain' },
+              { path: './${{ steps.version.outputs.deb_filename }}.sha256', name: '${{ steps.version.outputs.deb_filename }}.sha256', contentType: 'text/plain' },
+              { path: './radvan-go.md5', name: 'radvan-go.md5', contentType: 'text/plain' },
+              { path: './${{ steps.version.outputs.deb_filename }}.md5', name: '${{ steps.version.outputs.deb_filename }}.md5', contentType: 'text/plain' }
+            ];
+            
+            for (const asset of assets) {
+              console.log(`Uploading ${asset.name}...`);
+              const data = fs.readFileSync(asset.path);
+              await github.rest.repos.uploadReleaseAsset({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: parseInt(releaseId),
+                name: asset.name,
+                data: data
+              });
+            }
+
+      - name: Upload artifacts (no release)
+        if: steps.latest_release.outputs.has_release == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: radvan-go-build-${{ steps.version.outputs.version }}
+          path: |
+            radvan-go
+            ${{ steps.version.outputs.deb_filename }}
+            *.sha256
+            *.md5
+          retention-days: 30
+
+      - name: Create release summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Binary**: radvan-go" >> $GITHUB_STEP_SUMMARY
+          echo "- **Debian Package**: ${{ steps.version.outputs.deb_filename }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Architecture**: amd64" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Package Contents" >> $GITHUB_STEP_SUMMARY
+          echo "- Binary: /usr/local/bin/radvan-go" >> $GITHUB_STEP_SUMMARY
+          echo "- Service: /etc/systemd/system/radvan-go.service" >> $GITHUB_STEP_SUMMARY
+          echo "- Config: /etc/radvan-go/config.yaml.example" >> $GITHUB_STEP_SUMMARY
+          echo "- Documentation: /usr/share/doc/radvan-go/" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Installation" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "# Download and install the .deb package" >> $GITHUB_STEP_SUMMARY
+          echo "wget https://github.com/${{ github.repository }}/releases/download/\$TAG/${{ steps.version.outputs.deb_filename }}" >> $GITHUB_STEP_SUMMARY
+          echo "sudo dpkg -i ${{ steps.version.outputs.deb_filename }}" >> $GITHUB_STEP_SUMMARY
+          echo "sudo apt-get install -f  # Fix any dependency issues" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Configure and start" >> $GITHUB_STEP_SUMMARY
+          echo "sudo nano /etc/radvan-go/config.yaml" >> $GITHUB_STEP_SUMMARY
+          echo "sudo systemctl start radvan-go" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

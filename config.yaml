@@ -1,0 +1,42 @@
+interfaces:
+  enp9s0:
+    config1:
+      prefix:
+        allow:
+        - "2000::/3"
+        - "8::/16"
+        blacklist:
+        - "2001:db8::/32"
+      route:
+        allow:
+        - "2000::/3"
+        - "8::/16"
+        blacklist:
+        - "2001:db8::/32"
+      iptable: 200
+      auto-ip: true
+      routers:
+        allow:
+        - "a8:62:1:1::/64"
+        - "a3::/16"
+        blacklist:
+        - "a8:62:1:2::/64"
+        - "a3::/16"
+      addSelfRoute: true
+    config2:
+      match-dest:
+        - "2001:db8::/32"
+      iptable: 201
+      auto-ip: false
+      allowed-routers:
+        - "2001:db8::/32"
+  eth0:
+    cm1:
+      prefix:
+        allow:
+        - "2001:db8::/32"
+      iptable: 201
+      auto-ip: false
+      routers:
+        allow:
+        - "2001:db8::/32"
