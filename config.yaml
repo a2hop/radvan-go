@@ -1,4 +1,4 @@
-loglevel: silent # options: silent, verbose
+loglevel: verbose # Change to verbose to see what's happening
 interfaces:
   enp9s0:
     config1:
@@ -22,7 +22,7 @@ interfaces:
         - "a3::/16"
         blacklist:
         - "a8:62:1:2::/64"
-        - "a3::/16"
+        # Remove conflicting entry: - "a3::/16"
       addSelfRoute: true
     config2:
       match-dest:
@@ -31,6 +31,26 @@ interfaces:
       auto-ip: false
       allowed-routers:
         - "2001:db8::/32"
+  gtwl:  # Add your actual interface name
+    config1:
+      prefix:
+        allow:
+        - "2000::/3"
+        - "e2::/16"
+        blacklist: []
+      route:
+        allow:
+        - "2000::/3"
+        - "e2::/16"
+        blacklist: []
+      iptable: 100
+      auto-ip: false
+      routers:
+        allow:
+        - "fe80::/64"  # Allow link-local routers
+        blacklist:
+        - "fe80::216:3eff:fea7:5377/128"  # Blacklist the specific problematic router
+      addSelfRoute: false
   eth0:
     cm1:
       prefix:

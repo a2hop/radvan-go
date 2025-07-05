@@ -110,10 +110,13 @@ func (d *RADaemon) Stop() {
 }
 
 func (d *RADaemon) configureInterface(ifName string) error {
-	// Enable RA acceptance but disable autoconf
+	// Disable system RA processing completely
 	cmds := [][]string{
-		{"sysctl", "-w", fmt.Sprintf("net.ipv6.conf.%s.accept_ra=1", ifName)},
+		{"sysctl", "-w", fmt.Sprintf("net.ipv6.conf.%s.accept_ra=0", ifName)},
 		{"sysctl", "-w", fmt.Sprintf("net.ipv6.conf.%s.autoconf=0", ifName)},
+		{"sysctl", "-w", fmt.Sprintf("net.ipv6.conf.%s.accept_ra_defrtr=0", ifName)},
+		{"sysctl", "-w", fmt.Sprintf("net.ipv6.conf.%s.accept_ra_pinfo=0", ifName)},
+		{"sysctl", "-w", fmt.Sprintf("net.ipv6.conf.%s.accept_ra_rtr_pref=0", ifName)},
 	}
 
 	for _, cmd := range cmds {
@@ -122,6 +125,7 @@ func (d *RADaemon) configureInterface(ifName string) error {
 		}
 	}
 
+	d.logVerbose("Disabled system RA processing for interface %s", ifName)
 	return nil
 }
 
@@ -130,44 +134,61 @@ func (d *RADaemon) listenInterface(ifName string, configs map[string]*InterfaceC
 
 	d.logVerbose("Starting listener for interface %s with %d configurations", ifName, len(configs))
 
-	// Create ICMPv6 socket
-	conn, err := net.ListenPacket("ip6:ipv6-icmp", "::")
+	// Get interface to ensure it exists and get its index
+	iface, err := net.InterfaceByName(ifName)
 	if err != nil {
-		d.logSilent("Failed to create ICMPv6 socket for %s: %v", ifName, err)
+		d.logSilent("Failed to get interface %s: %v", ifName, err)
+		return
+	}
+
+	// Create ICMPv6 socket with more specific binding
+	addr, err := net.ResolveUDPAddr("udp6", "[::]:0")
+	if err != nil {
+		d.logSilent("Failed to resolve UDP address for %s: %v", ifName, err)
+		return
+	}
+
+	conn, err := net.ListenUDP("udp6", addr)
+	if err != nil {
+		d.logSilent("Failed to create UDP socket for %s: %v", ifName, err)
 		return
 	}
 	defer conn.Close()
 
-	d.logVerbose("Created ICMPv6 socket for %s", ifName)
+	// Convert to raw ICMPv6 socket
+	file, err := conn.File()
+	if err != nil {
+		d.logSilent("Failed to get file descriptor for %s: %v", ifName, err)
+		return
+	}
+	defer file.Close()
 
-	// Bind to specific interface
-	ipConn, ok := conn.(*net.IPConn)
-	if !ok {
-		d.logSilent("Failed to assert conn to *net.IPConn for %s", ifName)
+	fd := int(file.Fd())
+
+	// Set socket to ICMPv6
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_PROTOCOL, 58); err != nil {
+		d.logSilent("Failed to set ICMPv6 protocol for %s: %v", ifName, err)
 		return
 	}
 
-	// Use syscall to bind to interface
-	fd, err := ipConn.SyscallConn()
-	if err != nil {
-		d.logSilent("Failed to get syscall conn for %s: %v", ifName, err)
-		return
-	}
-
-	err = fd.Control(func(fdInt uintptr) {
-		syscall.SetsockoptString(int(fdInt), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, ifName)
-	})
-	if err != nil {
+	// Bind to specific interface using SO_BINDTODEVICE
+	if err := syscall.SetsockoptString(fd, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, ifName); err != nil {
 		d.logSilent("Failed to bind to interface %s: %v", ifName, err)
 		return
 	}
 
-	d.logVerbose("Bound socket to interface %s", ifName)
+	// Create new connection from file descriptor
+	newConn, err := net.FilePacketConn(file)
+	if err != nil {
+		d.logSilent("Failed to create packet conn for %s: %v", ifName, err)
+		return
+	}
+	defer newConn.Close()
 
-	d.listeners[ifName] = &conn
+	d.logVerbose("Bound socket to interface %s (index: %d)", ifName, iface.Index)
 
 	// Set ICMPv6 filter to only receive Router Advertisements
-	p := ipv6.NewPacketConn(conn)
+	p := ipv6.NewPacketConn(newConn)
 	filter := &ipv6.ICMPFilter{}
 	filter.SetAll(true)
 	filter.Accept(ipv6.ICMPTypeRouterAdvertisement)
@@ -179,6 +200,8 @@ func (d *RADaemon) listenInterface(ifName string, configs map[string]*InterfaceC
 
 	d.logVerbose("Set ICMPv6 filter for %s to accept Router Advertisements only", ifName)
 
+	d.listeners[ifName] = &newConn
+
 	d.logNormal("Listening for RAs on interface %s", ifName)
 
 	buffer := make([]byte, 1500)
@@ -188,8 +211,8 @@ func (d *RADaemon) listenInterface(ifName string, configs map[string]*InterfaceC
 			d.logVerbose("Stop signal received for interface %s", ifName)
 			return
 		default:
-			conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-			n, addr, err := conn.ReadFrom(buffer)
+			newConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+			n, addr, err := newConn.ReadFrom(buffer)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
@@ -285,7 +308,7 @@ func (d *RADaemon) processRA(ifName string, configs map[string]*InterfaceConfig,
 
 		// Check if this router is blacklisted
 		if config.IsRouterBlacklisted(routerIP) {
-			d.logVerbose("Router %s is blacklisted in config %s", routerIP, configName)
+			d.logNormal("Blocked RA from blacklisted router %s on %s (config: %s)", routerIP, ifName, configName)
 			if config.Routers != nil {
 				d.logVerbose("Router blacklist: %v", config.Routers.Blacklist)
 			}
@@ -294,7 +317,7 @@ func (d *RADaemon) processRA(ifName string, configs map[string]*InterfaceConfig,
 
 		// Check if this router is allowed
 		if !config.IsRouterAllowed(routerIP) {
-			d.logVerbose("Router %s not allowed in config %s", routerIP, configName)
+			d.logNormal("Blocked RA from unauthorized router %s on %s (config: %s)", routerIP, ifName, configName)
 			if config.Routers != nil {
 				d.logVerbose("Router allow list: %v", config.Routers.Allow)
 			}
