@@ -141,54 +141,42 @@ func (d *RADaemon) listenInterface(ifName string, configs map[string]*InterfaceC
 		return
 	}
 
-	// Create ICMPv6 socket with more specific binding
-	addr, err := net.ResolveUDPAddr("udp6", "[::]:0")
+	// Create ICMPv6 socket directly
+	conn, err := net.ListenPacket("ip6:ipv6-icmp", "::")
 	if err != nil {
-		d.logSilent("Failed to resolve UDP address for %s: %v", ifName, err)
-		return
-	}
-
-	conn, err := net.ListenUDP("udp6", addr)
-	if err != nil {
-		d.logSilent("Failed to create UDP socket for %s: %v", ifName, err)
+		d.logSilent("Failed to create ICMPv6 socket for %s: %v", ifName, err)
 		return
 	}
 	defer conn.Close()
 
-	// Convert to raw ICMPv6 socket
-	file, err := conn.File()
-	if err != nil {
-		d.logSilent("Failed to get file descriptor for %s: %v", ifName, err)
+	d.logVerbose("Created ICMPv6 socket for %s", ifName)
+
+	// Bind to specific interface using raw socket control
+	if rawConn, ok := conn.(*net.IPConn); ok {
+		fd, err := rawConn.SyscallConn()
+		if err != nil {
+			d.logSilent("Failed to get syscall conn for %s: %v", ifName, err)
+			return
+		}
+
+		err = fd.Control(func(fdInt uintptr) {
+			if err := syscall.SetsockoptString(int(fdInt), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, ifName); err != nil {
+				d.logSilent("Failed to bind to interface %s: %v", ifName, err)
+			}
+		})
+		if err != nil {
+			d.logSilent("Failed to control socket for %s: %v", ifName, err)
+			return
+		}
+	} else {
+		d.logSilent("Failed to assert conn to *net.IPConn for %s", ifName)
 		return
 	}
-	defer file.Close()
-
-	fd := int(file.Fd())
-
-	// Set socket to ICMPv6
-	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_PROTOCOL, 58); err != nil {
-		d.logSilent("Failed to set ICMPv6 protocol for %s: %v", ifName, err)
-		return
-	}
-
-	// Bind to specific interface using SO_BINDTODEVICE
-	if err := syscall.SetsockoptString(fd, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, ifName); err != nil {
-		d.logSilent("Failed to bind to interface %s: %v", ifName, err)
-		return
-	}
-
-	// Create new connection from file descriptor
-	newConn, err := net.FilePacketConn(file)
-	if err != nil {
-		d.logSilent("Failed to create packet conn for %s: %v", ifName, err)
-		return
-	}
-	defer newConn.Close()
 
 	d.logVerbose("Bound socket to interface %s (index: %d)", ifName, iface.Index)
 
 	// Set ICMPv6 filter to only receive Router Advertisements
-	p := ipv6.NewPacketConn(newConn)
+	p := ipv6.NewPacketConn(conn)
 	filter := &ipv6.ICMPFilter{}
 	filter.SetAll(true)
 	filter.Accept(ipv6.ICMPTypeRouterAdvertisement)
@@ -200,7 +188,7 @@ func (d *RADaemon) listenInterface(ifName string, configs map[string]*InterfaceC
 
 	d.logVerbose("Set ICMPv6 filter for %s to accept Router Advertisements only", ifName)
 
-	d.listeners[ifName] = &newConn
+	d.listeners[ifName] = &conn
 
 	d.logNormal("Listening for RAs on interface %s", ifName)
 
@@ -211,8 +199,8 @@ func (d *RADaemon) listenInterface(ifName string, configs map[string]*InterfaceC
 			d.logVerbose("Stop signal received for interface %s", ifName)
 			return
 		default:
-			newConn.SetReadDeadline(time.Now().Add(1 * time.Second))
-			n, addr, err := newConn.ReadFrom(buffer)
+			conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+			n, addr, err := conn.ReadFrom(buffer)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
